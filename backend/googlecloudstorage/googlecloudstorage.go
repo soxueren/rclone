@@ -148,6 +148,10 @@ func init() {
 				Help:  "Project team owners get OWNER access, and all Users get WRITER access.",
 			}},
 		}, {
+			Name:    "bucket_policy_only",
+			Help:    "Access checks should use bucket-level IAM policies.",
+			Default: false,
+		}, {
 			Name: "location",
 			Help: "Location for the newly created buckets.",
 			Examples: []fs.OptionExample{{
@@ -244,6 +248,7 @@ type Options struct {
 	ServiceAccountCredentials string `config:"service_account_credentials"`
 	ObjectACL                 string `config:"object_acl"`
 	BucketACL                 string `config:"bucket_acl"`
+	BucketPolicyOnly          bool   `config:"bucket_policy_only"`
 	Location                  string `config:"location"`
 	StorageClass              string `config:"storage_class"`
 }
@@ -717,7 +722,11 @@ func (f *Fs) Mkdir(dir string) (err error) {
 		StorageClass: f.opt.StorageClass,
 	}
 	err = f.pacer.Call(func() (bool, error) {
-		_, err = f.svc.Buckets.Insert(f.opt.ProjectNumber, &bucket).PredefinedAcl(f.opt.BucketACL).Do()
+		insertBucket := f.svc.Buckets.Insert(f.opt.ProjectNumber, &bucket)
+		if !f.opt.BucketPolicyOnly {
+			insertBucket.PredefinedAcl(f.opt.BucketACL)
+		}
+		_, err = insertBucket.Do()
 		return shouldRetry(err)
 	})
 	if err == nil {
@@ -983,7 +992,11 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	}
 	var newObject *storage.Object
 	err = o.fs.pacer.CallNoRetry(func() (bool, error) {
-		newObject, err = o.fs.svc.Objects.Insert(o.fs.bucket, &object).Media(in, googleapi.ContentType("")).Name(object.Name).PredefinedAcl(o.fs.opt.ObjectACL).Do()
+		insertObject := o.fs.svc.Objects.Insert(o.fs.bucket, &object).Media(in, googleapi.ContentType("")).Name(object.Name)
+		if !o.fs.opt.BucketPolicyOnly {
+			insertObject.PredefinedAcl(o.fs.opt.ObjectACL)
+		}
+		newObject, err = insertObject.Do()
 		return shouldRetry(err)
 	})
 	if err != nil {
