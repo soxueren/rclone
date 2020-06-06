@@ -7,10 +7,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/lib/pool"
-	"github.com/ncw/rclone/lib/readers"
 	"github.com/pkg/errors"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/lib/pool"
+	"github.com/rclone/rclone/lib/readers"
 )
 
 const (
@@ -21,7 +21,8 @@ const (
 	bufferCacheFlushTime = 5 * time.Second // flush the cached buffers after this long
 )
 
-var errorStreamAbandoned = errors.New("stream abandoned")
+// ErrorStreamAbandoned is returned when the input is closed before the end of the stream
+var ErrorStreamAbandoned = errors.New("stream abandoned")
 
 // AsyncReader will do async read-ahead from the input reader
 // and make the data available as an io.Reader.
@@ -132,7 +133,7 @@ func (a *AsyncReader) fill() (err error) {
 		if !ok {
 			// Return an error to show fill failed
 			if a.err == nil {
-				return errorStreamAbandoned
+				return ErrorStreamAbandoned
 			}
 			return a.err
 		}
@@ -174,6 +175,9 @@ func (a *AsyncReader) WriteTo(w io.Writer) (n int64, err error) {
 	n = 0
 	for {
 		err = a.fill()
+		if err == io.EOF {
+			return n, nil
+		}
 		if err != nil {
 			return n, err
 		}
@@ -181,6 +185,10 @@ func (a *AsyncReader) WriteTo(w io.Writer) (n int64, err error) {
 		a.cur.increment(n2)
 		n += int64(n2)
 		if err != nil {
+			return n, err
+		}
+		if a.cur.err == io.EOF {
+			a.err = a.cur.err
 			return n, err
 		}
 		if a.cur.err != nil {

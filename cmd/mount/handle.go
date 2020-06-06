@@ -1,15 +1,15 @@
-// +build linux darwin freebsd
+// +build linux,go1.13 darwin,go1.13 freebsd,go1.13
 
 package mount
 
 import (
+	"context"
 	"io"
 
 	"bazil.org/fuse"
 	fusefs "bazil.org/fuse/fs"
-	"github.com/ncw/rclone/fs/log"
-	"github.com/ncw/rclone/vfs"
-	"golang.org/x/net/context" // switch to "context" when we stop supporting go1.8
+	"github.com/rclone/rclone/fs/log"
+	"github.com/rclone/rclone/vfs"
 )
 
 // FileHandle is an open for read file handle on a File

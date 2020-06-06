@@ -122,9 +122,10 @@ type Connection struct {
 	// These are filled in after Authenticate is called as are the defaults for above
 	StorageUrl string
 	AuthToken  string
+	Expires    time.Time // time the token expires, may be Zero if unknown
 	client     *http.Client
 	Auth       Authenticator `json:"-" xml:"-"` // the current authenticator
-	authLock   sync.Mutex    // lock when R/W StorageUrl, AuthToken, Auth
+	authLock   *sync.Mutex   // lock when R/W StorageUrl, AuthToken, Auth
 	// swiftInfo is filled after QueryInfo is called
 	swiftInfo SwiftInfo
 }
@@ -307,6 +308,7 @@ var (
 	Forbidden           = newError(403, "Operation forbidden")
 	TooLargeObject      = newError(413, "Too Large Object")
 	RateLimit           = newError(498, "Rate Limit")
+	TooManyRequests     = newError(429, "TooManyRequests")
 
 	// Mappings for authentication errors
 	authErrorMap = errorMap{
@@ -332,6 +334,7 @@ var (
 		404: ObjectNotFound,
 		413: TooLargeObject,
 		422: ObjectCorrupted,
+		429: TooManyRequests,
 		498: RateLimit,
 	}
 )
@@ -455,6 +458,9 @@ func (c *Connection) setDefaults() {
 // If you don't call it before calling one of the connection methods
 // then it will be called for you on the first access.
 func (c *Connection) Authenticate() (err error) {
+	if c.authLock == nil {
+		c.authLock = &sync.Mutex{}
+	}
 	c.authLock.Lock()
 	defer c.authLock.Unlock()
 	return c.authenticate()
@@ -519,6 +525,12 @@ again:
 		c.StorageUrl = c.Auth.StorageUrl(c.Internal)
 	}
 	c.AuthToken = c.Auth.Token()
+	if do, ok := c.Auth.(Expireser); ok {
+		c.Expires = do.Expires()
+	} else {
+		c.Expires = time.Time{}
+	}
+
 	if !c.authenticated() {
 		err = newError(0, "Response didn't have storage url and auth token")
 		return
@@ -571,6 +583,9 @@ func (c *Connection) UnAuthenticate() {
 //
 // Doesn't actually check the credentials against the server.
 func (c *Connection) Authenticated() bool {
+	if c.authLock == nil {
+		c.authLock = &sync.Mutex{}
+	}
 	c.authLock.Lock()
 	defer c.authLock.Unlock()
 	return c.authenticated()
@@ -580,7 +595,14 @@ func (c *Connection) Authenticated() bool {
 //
 // Call with authLock held
 func (c *Connection) authenticated() bool {
-	return c.StorageUrl != "" && c.AuthToken != ""
+	if c.StorageUrl == "" || c.AuthToken == "" {
+		return false
+	}
+	if c.Expires.IsZero() {
+		return true
+	}
+	timeUntilExpiry := c.Expires.Sub(time.Now())
+	return timeUntilExpiry >= 60*time.Second
 }
 
 // SwiftInfo contains the JSON object returned by Swift when the /info
@@ -720,11 +742,11 @@ func (c *Connection) Call(targetUrl string, p RequestOpts) (resp *http.Response,
 			for k, v := range p.Headers {
 				// Set ContentLength in req if the user passed it in in the headers
 				if k == "Content-Length" {
-					contentLength, err := strconv.ParseInt(v, 10, 64)
+					req.ContentLength, err = strconv.ParseInt(v, 10, 64)
 					if err != nil {
-						return nil, nil, fmt.Errorf("Invalid %q header %q: %v", k, v, err)
+						err = fmt.Errorf("Invalid %q header %q: %v", k, v, err)
+						return
 					}
-					req.ContentLength = contentLength
 				} else {
 					req.Header.Add(k, v)
 				}
@@ -742,7 +764,7 @@ func (c *Connection) Call(targetUrl string, p RequestOpts) (resp *http.Response,
 				retries--
 				continue
 			}
-			return nil, nil, err
+			return
 		}
 		// Check to see if token has expired
 		if resp.StatusCode == 401 && retries > 0 {
@@ -754,15 +776,14 @@ func (c *Connection) Call(targetUrl string, p RequestOpts) (resp *http.Response,
 		}
 	}
 
-	if err = c.parseHeaders(resp, p.ErrorMap); err != nil {
-		return nil, nil, err
-	}
 	headers = readHeaders(resp)
+	if err = c.parseHeaders(resp, p.ErrorMap); err != nil {
+		return
+	}
 	if p.NoResponse {
-		var err error
 		drainAndClose(resp.Body, &err)
 		if err != nil {
-			return nil, nil, err
+			return
 		}
 	} else {
 		// Cancel the request on timeout
@@ -969,13 +990,14 @@ func (c *Connection) ContainerNamesAll(opts *ContainersOpts) ([]string, error) {
 
 // ObjectOpts is options for Objects() and ObjectNames()
 type ObjectsOpts struct {
-	Limit     int     // For an integer value n, limits the number of results to at most n values.
-	Marker    string  // Given a string value x, return object names greater in value than the  specified marker.
-	EndMarker string  // Given a string value x, return object names less in value than the specified marker
-	Prefix    string  // For a string value x, causes the results to be limited to object names beginning with the substring x.
-	Path      string  // For a string value x, return the object names nested in the pseudo path
-	Delimiter rune    // For a character c, return all the object names nested in the container
-	Headers   Headers // Any additional HTTP headers - can be nil
+	Limit      int     // For an integer value n, limits the number of results to at most n values.
+	Marker     string  // Given a string value x, return object names greater in value than the  specified marker.
+	EndMarker  string  // Given a string value x, return object names less in value than the specified marker
+	Prefix     string  // For a string value x, causes the results to be limited to object names beginning with the substring x.
+	Path       string  // For a string value x, return the object names nested in the pseudo path
+	Delimiter  rune    // For a character c, return all the object names nested in the container
+	Headers    Headers // Any additional HTTP headers - can be nil
+	KeepMarker bool    // Do not reset Marker when using ObjectsAll or ObjectNamesAll
 }
 
 // parse reads values out of ObjectsOpts
@@ -1091,6 +1113,7 @@ func (c *Connection) Objects(container string, opts *ObjectsOpts) ([]Object, err
 
 // objectsAllOpts makes a copy of opts if set or makes a new one and
 // overrides Limit and Marker
+// Marker is not overriden if KeepMarker is set
 func objectsAllOpts(opts *ObjectsOpts, Limit int) *ObjectsOpts {
 	var newOpts ObjectsOpts
 	if opts != nil {
@@ -1099,7 +1122,9 @@ func objectsAllOpts(opts *ObjectsOpts, Limit int) *ObjectsOpts {
 	if newOpts.Limit == 0 {
 		newOpts.Limit = Limit
 	}
-	newOpts.Marker = ""
+	if !newOpts.KeepMarker {
+		newOpts.Marker = ""
+	}
 	return &newOpts
 }
 
@@ -1168,7 +1193,8 @@ func (c *Connection) ObjectsAll(container string, opts *ObjectsOpts) ([]Object, 
 
 // ObjectNamesAll is like ObjectNames but it returns all the Objects
 //
-// It calls ObjectNames multiple times using the Marker parameter
+// It calls ObjectNames multiple times using the Marker parameter. Marker is
+// reset unless KeepMarker is set
 //
 // It has a default Limit parameter but you may pass in your own
 func (c *Connection) ObjectNamesAll(container string, opts *ObjectsOpts) ([]string, error) {
@@ -1462,6 +1488,22 @@ func (c *Connection) ObjectCreate(container string, objectName string, checkHash
 		pipeReader.Close()
 		close(file.done)
 	}()
+	return
+}
+
+func (c *Connection) ObjectSymlinkCreate(container string, symlink string, targetAccount string, targetContainer string, targetObject string, targetEtag string) (headers Headers, err error) {
+
+	EMPTY_MD5 := "d41d8cd98f00b204e9800998ecf8427e"
+	symHeaders := Headers{}
+	contents := bytes.NewBufferString("")
+	if targetAccount != "" {
+		symHeaders["X-Symlink-Target-Account"] = targetAccount
+	}
+	if targetEtag != "" {
+		symHeaders["X-Symlink-Target-Etag"] = targetEtag
+	}
+	symHeaders["X-Symlink-Target"] = fmt.Sprintf("%s/%s", targetContainer, targetObject)
+	_, err = c.ObjectPut(container, symlink, contents, true, EMPTY_MD5, "application/symlink", symHeaders)
 	return
 }
 

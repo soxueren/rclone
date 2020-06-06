@@ -1,7 +1,6 @@
 ---
 title: "FAQ"
 description: "Rclone Frequently Asked Questions"
-date: "2015-08-27"
 ---
 
 Frequently Asked Questions
@@ -49,7 +48,7 @@ Server B> rclone sync /tmp/whatever remote:ServerB
 ```
 
 If you sync to the same directory then you should use rclone copy
-otherwise the two rclones may delete each others files, eg
+otherwise the two instances of rclone may delete each other's files, eg
 
 ```
 Server A> rclone copy /tmp/whatever remote:Backup
@@ -145,7 +144,7 @@ curl -o /etc/ssl/certs/ca-certificates.crt https://raw.githubusercontent.com/bag
 ntpclient -s -h pool.ntp.org
 ```
 
-The two environment variables `SSL_CERT_FILE` and `SSL_CERT_DIR`, mentioned in the [x509 pacakge](https://godoc.org/crypto/x509),
+The two environment variables `SSL_CERT_FILE` and `SSL_CERT_DIR`, mentioned in the [x509 package](https://godoc.org/crypto/x509),
 provide an additional way to provide the SSL root certificates.
 
 Note that you may need to add the `--insecure` option to the `curl` command line if it doesn't work without.
@@ -188,3 +187,26 @@ causes not all domains to be resolved properly.
 Additionally with the `GODEBUG=netdns=` environment variable the Go
 resolver decision can be influenced. This also allows to resolve certain
 issues with DNS resolution. See the [name resolution section in the go docs](https://golang.org/pkg/net/#hdr-Name_Resolution).
+
+### The total size reported in the stats for a sync is wrong and keeps changing
+
+It is likely you have more than 10,000 files that need to be
+synced. By default rclone only gets 10,000 files ahead in a sync so as
+not to use up too much memory. You can change this default with the
+[--max-backlog](/docs/#max-backlog-n) flag.
+
+### Rclone is using too much memory or appears to have a memory leak
+
+Rclone is written in Go which uses a garbage collector.  The default
+settings for the garbage collector mean that it runs when the heap
+size has doubled.
+
+However it is possible to tune the garbage collector to use less
+memory by [setting GOGC](https://dave.cheney.net/tag/gogc) to a lower
+value, say `export GOGC=20`.  This will make the garbage collector
+work harder, reducing memory size at the expense of CPU usage.
+
+The most common cause of rclone using lots of memory is a single
+directory with thousands or millions of files in.  Rclone has to load
+this entirely into memory as rclone objects.  Each rclone object takes
+0.5k-1k of memory.

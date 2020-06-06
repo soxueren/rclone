@@ -1,4 +1,4 @@
-// Package cmount implents a FUSE mounting system for rclone remotes.
+// Package cmount implements a FUSE mounting system for rclone remotes.
 //
 // This uses the cgo based cgofuse library
 
@@ -17,12 +17,20 @@ import (
 	"time"
 
 	"github.com/billziss-gh/cgofuse/fuse"
-	"github.com/ncw/rclone/cmd/mountlib"
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/vfs"
-	"github.com/ncw/rclone/vfs/vfsflags"
 	"github.com/okzk/sdnotify"
 	"github.com/pkg/errors"
+	"github.com/rclone/rclone/cmd/mountlib"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/lib/atexit"
+	"github.com/rclone/rclone/vfs"
+	"github.com/rclone/rclone/vfs/vfsflags"
+)
+
+const (
+	// SetCapReaddirPlus informs the host that the hosted file system has the readdir-plus
+	// capability [Windows only]. A file system that has the readdir-plus capability can send
+	// full stat information during Readdir, thus avoiding extraneous Getattr calls.
+	usingReaddirPlus = runtime.GOOS == "windows"
 )
 
 func init() {
@@ -30,7 +38,10 @@ func init() {
 	if runtime.GOOS == "windows" {
 		name = "mount"
 	}
-	mountlib.NewMountCommand(name, Mount)
+	mountlib.NewMountCommand(name, false, Mount)
+	// Add mount to rc
+	mountlib.AddRc("cmount", mount)
+
 }
 
 // mountOptions configures the options from the command line flags
@@ -127,7 +138,7 @@ func waitFor(fn func() bool) (ok bool) {
 func mount(f fs.Fs, mountpoint string) (*vfs.VFS, <-chan error, func() error, error) {
 	fs.Debugf(f, "Mounting on %q", mountpoint)
 
-	// Check the mountpoint - in Windows the mountpoint musn't exist before the mount
+	// Check the mountpoint - in Windows the mountpoint mustn't exist before the mount
 	if runtime.GOOS != "windows" {
 		fi, err := os.Stat(mountpoint)
 		if err != nil {
@@ -141,6 +152,10 @@ func mount(f fs.Fs, mountpoint string) (*vfs.VFS, <-chan error, func() error, er
 	// Create underlying FS
 	fsys := NewFS(f)
 	host := fuse.NewFileSystemHost(fsys)
+	if usingReaddirPlus {
+		host.SetCapReaddirPlus(true)
+	}
+	host.SetCapCaseInsensitive(f.Features().CaseInsensitive)
 
 	// Create options
 	options := mountOptions(f.Name()+":"+f.Root(), mountpoint)
@@ -207,7 +222,7 @@ func mount(f fs.Fs, mountpoint string) (*vfs.VFS, <-chan error, func() error, er
 // If noModTime is set then it
 func Mount(f fs.Fs, mountpoint string) error {
 	// Mount it
-	FS, errChan, _, err := mount(f, mountpoint)
+	FS, errChan, unmount, err := mount(f, mountpoint)
 	if err != nil {
 		return errors.Wrap(err, "failed to mount FUSE fs")
 	}
@@ -216,6 +231,10 @@ func Mount(f fs.Fs, mountpoint string) error {
 
 	sigHup := make(chan os.Signal, 1)
 	signal.Notify(sigHup, syscall.SIGHUP)
+
+	atexit.Register(func() {
+		_ = unmount()
+	})
 
 	if err := sdnotify.Ready(); err != nil && err != sdnotify.ErrSdNotifyNoSocket {
 		return errors.Wrap(err, "failed to notify systemd")

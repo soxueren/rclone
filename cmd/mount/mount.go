@@ -1,6 +1,6 @@
-// Package mount implents a FUSE mounting system for rclone remotes.
+// Package mount implements a FUSE mounting system for rclone remotes.
 
-// +build linux darwin freebsd
+// +build linux,go1.13 darwin,go1.13 freebsd,go1.13
 
 package mount
 
@@ -12,17 +12,19 @@ import (
 
 	"bazil.org/fuse"
 	fusefs "bazil.org/fuse/fs"
-	"github.com/ncw/rclone/cmd/mountlib"
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/lib/atexit"
-	"github.com/ncw/rclone/vfs"
-	"github.com/ncw/rclone/vfs/vfsflags"
 	"github.com/okzk/sdnotify"
 	"github.com/pkg/errors"
+	"github.com/rclone/rclone/cmd/mountlib"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/lib/atexit"
+	"github.com/rclone/rclone/vfs"
+	"github.com/rclone/rclone/vfs/vfsflags"
 )
 
 func init() {
-	mountlib.NewMountCommand("mount", Mount)
+	mountlib.NewMountCommand("mount", false, Mount)
+	// Add mount to rc
+	mountlib.AddRc("mount", mount)
 }
 
 // mountOptions configures the options from the command line flags
@@ -35,10 +37,10 @@ func mountOptions(device string) (options []fuse.MountOption) {
 
 		// Options from benchmarking in the fuse module
 		//fuse.MaxReadahead(64 * 1024 * 1024),
-		//fuse.AsyncRead(), - FIXME this causes
-		// ReadFileHandle.Read error: read /home/files/ISOs/xubuntu-15.10-desktop-amd64.iso: bad file descriptor
-		// which is probably related to errors people are having
 		//fuse.WritebackCache(),
+	}
+	if mountlib.AsyncRead {
+		options = append(options, fuse.AsyncRead())
 	}
 	if mountlib.NoAppleDouble {
 		options = append(options, fuse.NoAppleDouble())
@@ -53,7 +55,8 @@ func mountOptions(device string) (options []fuse.MountOption) {
 		options = append(options, fuse.AllowOther())
 	}
 	if mountlib.AllowRoot {
-		options = append(options, fuse.AllowRoot())
+		// options = append(options, fuse.AllowRoot())
+		fs.Errorf(nil, "Ignoring --allow-root. Support has been removed upstream - see https://github.com/bazil/fuse/issues/144 for more info")
 	}
 	if mountlib.DefaultPermissions {
 		options = append(options, fuse.DefaultPermissions())
@@ -70,7 +73,7 @@ func mountOptions(device string) (options []fuse.MountOption) {
 	if len(mountlib.ExtraOptions) > 0 {
 		fs.Errorf(nil, "-o/--option not supported with this FUSE backend")
 	}
-	if len(mountlib.ExtraOptions) > 0 {
+	if len(mountlib.ExtraFlags) > 0 {
 		fs.Errorf(nil, "--fuse-flag not supported with this FUSE backend")
 	}
 	return options
@@ -139,6 +142,9 @@ func Mount(f fs.Fs, mountpoint string) error {
 	sigHup := make(chan os.Signal, 1)
 	signal.Notify(sigHup, syscall.SIGHUP)
 	atexit.IgnoreSignals()
+	atexit.Register(func() {
+		_ = unmount()
+	})
 
 	if err := sdnotify.Ready(); err != nil && err != sdnotify.ErrSdNotifyNoSocket {
 		return errors.Wrap(err, "failed to notify systemd")

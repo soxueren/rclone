@@ -2,6 +2,8 @@
 package fs
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -14,13 +16,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ncw/rclone/fs/config/configmap"
-	"github.com/ncw/rclone/fs/config/configstruct"
-	"github.com/ncw/rclone/fs/fserrors"
-	"github.com/ncw/rclone/fs/fspath"
-	"github.com/ncw/rclone/fs/hash"
-	"github.com/ncw/rclone/lib/pacer"
 	"github.com/pkg/errors"
+	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/fserrors"
+	"github.com/rclone/rclone/fs/fspath"
+	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/pacer"
 )
 
 // EntryType can be associated with remote paths to identify their type
@@ -49,6 +51,7 @@ var (
 	ErrorCantCopy                    = errors.New("can't copy object - incompatible remotes")
 	ErrorCantMove                    = errors.New("can't move object - incompatible remotes")
 	ErrorCantDirMove                 = errors.New("can't move directory - incompatible remotes")
+	ErrorCantUploadEmptyFiles        = errors.New("can't upload empty files to this remote")
 	ErrorDirExists                   = errors.New("can't copy directory - destination already exists")
 	ErrorCantSetModTime              = errors.New("can't set modified time")
 	ErrorCantSetModTimeWithoutDelete = errors.New("can't set modified time without deleting existing object")
@@ -58,13 +61,16 @@ var (
 	ErrorListAborted                 = errors.New("list aborted")
 	ErrorListBucketRequired          = errors.New("bucket or container name is needed in remote")
 	ErrorIsFile                      = errors.New("is a file not a directory")
-	ErrorNotAFile                    = errors.New("is a not a regular file")
+	ErrorNotAFile                    = errors.New("is not a regular file")
 	ErrorNotDeleting                 = errors.New("not deleting files as there were IO errors")
 	ErrorNotDeletingDirs             = errors.New("not deleting directories as there were IO errors")
 	ErrorOverlapping                 = errors.New("can't sync or move files on overlapping remotes")
 	ErrorDirectoryNotEmpty           = errors.New("directory not empty")
 	ErrorImmutableModified           = errors.New("immutable file modified")
 	ErrorPermissionDenied            = errors.New("permission denied")
+	ErrorCantShareDirectories        = errors.New("this backend can't share directories with link")
+	ErrorNotImplemented              = errors.New("optional feature not implemented")
+	ErrorCommandNotFound             = errors.New("command not found")
 )
 
 // RegInfo provides information about a filesystem
@@ -76,13 +82,15 @@ type RegInfo struct {
 	// Prefix for command line flags for this fs - defaults to Name if not set
 	Prefix string
 	// Create a new file system.  If root refers to an existing
-	// object, then it should return a Fs which which points to
+	// object, then it should return an Fs which which points to
 	// the parent of that object and ErrorIsFile.
 	NewFs func(name string, root string, config configmap.Mapper) (Fs, error) `json:"-"`
 	// Function to call to help with config
 	Config func(name string, config configmap.Mapper) `json:"-"`
 	// Options for the Fs configuration
 	Options Options
+	// The command help, if any
+	CommandHelp []CommandHelp
 }
 
 // FileName returns the on disk file name for this backend
@@ -101,6 +109,17 @@ func (os Options) setValues() {
 			o.Default = ""
 		}
 	}
+}
+
+// Get the Option corresponding to name or return nil if not found
+func (os Options) Get(name string) *Option {
+	for i := range os {
+		opt := &os[i]
+		if opt.Name == name {
+			return opt
+		}
+	}
+	return nil
 }
 
 // OptionVisibility controls whether the options are visible in the
@@ -132,11 +151,37 @@ type Option struct {
 	Advanced   bool             // set if this is an advanced config option
 }
 
+// BaseOption is an alias for Option used internally
+type BaseOption Option
+
+// MarshalJSON turns an Option into JSON
+//
+// It adds some generated fields for ease of use
+// - DefaultStr - a string rendering of Default
+// - ValueStr - a string rendering of Value
+// - Type - the type of the option
+func (o *Option) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		BaseOption
+		DefaultStr string
+		ValueStr   string
+		Type       string
+	}{
+		BaseOption: BaseOption(*o),
+		DefaultStr: fmt.Sprint(o.Default),
+		ValueStr:   o.String(),
+		Type:       o.Type(),
+	})
+}
+
 // GetValue gets the current current value which is the default if not set
 func (o *Option) GetValue() interface{} {
 	val := o.Value
 	if val == nil {
 		val = o.Default
+		if val == nil {
+			val = ""
+		}
 	}
 	return val
 }
@@ -146,7 +191,7 @@ func (o *Option) String() string {
 	return fmt.Sprint(o.GetValue())
 }
 
-// Set a Option from a string
+// Set an Option from a string
 func (o *Option) Set(s string) (err error) {
 	newValue, err := configstruct.StringToInterface(o.GetValue(), s)
 	if err != nil {
@@ -221,32 +266,32 @@ type Fs interface {
 	//
 	// This should return ErrDirNotFound if the directory isn't
 	// found.
-	List(dir string) (entries DirEntries, err error)
+	List(ctx context.Context, dir string) (entries DirEntries, err error)
 
 	// NewObject finds the Object at remote.  If it can't be found
 	// it returns the error ErrorObjectNotFound.
-	NewObject(remote string) (Object, error)
+	NewObject(ctx context.Context, remote string) (Object, error)
 
 	// Put in to the remote path with the modTime given of the given size
 	//
-	// When called from outside a Fs by rclone, src.Size() will always be >= 0.
+	// When called from outside an Fs by rclone, src.Size() will always be >= 0.
 	// But for unknown-sized objects (indicated by src.Size() == -1), Put should either
 	// return an error or upload it properly (rather than e.g. calling panic).
 	//
 	// May create the object even if it returns an error - if so
 	// will return the object and the error, otherwise will return
 	// nil and the error
-	Put(in io.Reader, src ObjectInfo, options ...OpenOption) (Object, error)
+	Put(ctx context.Context, in io.Reader, src ObjectInfo, options ...OpenOption) (Object, error)
 
 	// Mkdir makes the directory (container, bucket)
 	//
 	// Shouldn't return an error if it already exists
-	Mkdir(dir string) error
+	Mkdir(ctx context.Context, dir string) error
 
 	// Rmdir removes the directory (container, bucket) if empty
 	//
 	// Return an error if it doesn't exist or isn't empty
-	Rmdir(dir string) error
+	Rmdir(ctx context.Context, dir string) error
 }
 
 // Info provides a read only interface to information about a filesystem.
@@ -275,20 +320,20 @@ type Object interface {
 	ObjectInfo
 
 	// SetModTime sets the metadata on the object to set the modification date
-	SetModTime(time.Time) error
+	SetModTime(ctx context.Context, t time.Time) error
 
 	// Open opens the file for read.  Call Close() on the returned io.ReadCloser
-	Open(options ...OpenOption) (io.ReadCloser, error)
+	Open(ctx context.Context, options ...OpenOption) (io.ReadCloser, error)
 
 	// Update in to the object with the modTime given of the given size
 	//
-	// When called from outside a Fs by rclone, src.Size() will always be >= 0.
+	// When called from outside an Fs by rclone, src.Size() will always be >= 0.
 	// But for unknown-sized objects (indicated by src.Size() == -1), Upload should either
 	// return an error or update the object properly (rather than e.g. calling panic).
-	Update(in io.Reader, src ObjectInfo, options ...OpenOption) error
+	Update(ctx context.Context, in io.Reader, src ObjectInfo, options ...OpenOption) error
 
 	// Removes this object
-	Remove() error
+	Remove(ctx context.Context) error
 }
 
 // ObjectInfo provides read only information about an object.
@@ -300,7 +345,7 @@ type ObjectInfo interface {
 
 	// Hash returns the selected checksum of the file
 	// If no checksum is available it returns ""
-	Hash(hash.Type) (string, error)
+	Hash(ctx context.Context, ty hash.Type) (string, error)
 
 	// Storable says whether this object can be stored
 	Storable() bool
@@ -318,7 +363,7 @@ type DirEntry interface {
 
 	// ModTime returns the modification date of the file
 	// It should return a best guess if one isn't available
-	ModTime() time.Time
+	ModTime(context.Context) time.Time
 
 	// Size returns the size of the file
 	Size() int64
@@ -341,7 +386,7 @@ type Directory interface {
 type MimeTyper interface {
 	// MimeType returns the content type of the Object if
 	// known, or "" if not
-	MimeType() string
+	MimeType(ctx context.Context) string
 }
 
 // IDer is an optional interface for Object
@@ -370,6 +415,58 @@ type GetTierer interface {
 	GetTier() string
 }
 
+// FullObjectInfo contains all the read-only optional interfaces
+//
+// Use for checking making wrapping ObjectInfos implement everything
+type FullObjectInfo interface {
+	ObjectInfo
+	MimeTyper
+	IDer
+	ObjectUnWrapper
+	GetTierer
+}
+
+// FullObject contains all the optional interfaces for Object
+//
+// Use for checking making wrapping Objects implement everything
+type FullObject interface {
+	Object
+	MimeTyper
+	IDer
+	ObjectUnWrapper
+	GetTierer
+	SetTierer
+}
+
+// ObjectOptionalInterfaces returns the names of supported and
+// unsupported optional interfaces for an Object
+func ObjectOptionalInterfaces(o Object) (supported, unsupported []string) {
+	store := func(ok bool, name string) {
+		if ok {
+			supported = append(supported, name)
+		} else {
+			unsupported = append(unsupported, name)
+		}
+	}
+
+	_, ok := o.(MimeTyper)
+	store(ok, "MimeType")
+
+	_, ok = o.(IDer)
+	store(ok, "ID")
+
+	_, ok = o.(ObjectUnWrapper)
+	store(ok, "UnWrap")
+
+	_, ok = o.(SetTierer)
+	store(ok, "SetTier")
+
+	_, ok = o.(GetTierer)
+	store(ok, "GetTier")
+
+	return supported, unsupported
+}
+
 // ListRCallback defines a callback function for ListR to use
 //
 // It is called for each tranche of entries read from the listing and
@@ -377,7 +474,7 @@ type GetTierer interface {
 type ListRCallback func(entries DirEntries) error
 
 // ListRFn is defines the call used to recursively list a directory
-type ListRFn func(dir string, callback ListRCallback) error
+type ListRFn func(ctx context.Context, dir string, callback ListRCallback) error
 
 // NewUsageValue makes a valid value
 func NewUsageValue(value int64) *int64 {
@@ -398,6 +495,12 @@ type Usage struct {
 	Objects *int64 `json:"objects,omitempty"` // objects in the storage system
 }
 
+// WriterAtCloser wraps io.WriterAt and io.Closer
+type WriterAtCloser interface {
+	io.WriterAt
+	io.Closer
+}
+
 // Features describe the optional features of the Fs
 type Features struct {
 	// Feature flags, whether Fs
@@ -407,8 +510,11 @@ type Features struct {
 	WriteMimeType           bool // can set the mime type of objects
 	CanHaveEmptyDirectories bool // can have empty directories
 	BucketBased             bool // is bucket based (like s3, swift etc)
+	BucketBasedRootOK       bool // is bucket based and can use from root
 	SetTier                 bool // allows set tier functionality on objects
 	GetTier                 bool // allows to retrieve storage tier of objects
+	ServerSideAcrossConfigs bool // can server side copy between different remotes of the same type
+	IsLocal                 bool // is the local backend
 
 	// Purge all files in the root and the root directory
 	//
@@ -416,7 +522,7 @@ type Features struct {
 	// quicker than just running Remove() on the result of List()
 	//
 	// Return an error if it doesn't exist
-	Purge func() error
+	Purge func(ctx context.Context) error
 
 	// Copy src to this remote using server side copy operations.
 	//
@@ -427,7 +533,7 @@ type Features struct {
 	// Will only be called if src.Fs().Name() == f.Name()
 	//
 	// If it isn't possible then return fs.ErrorCantCopy
-	Copy func(src Object, remote string) (Object, error)
+	Copy func(ctx context.Context, src Object, remote string) (Object, error)
 
 	// Move src to this remote using server side move operations.
 	//
@@ -438,7 +544,7 @@ type Features struct {
 	// Will only be called if src.Fs().Name() == f.Name()
 	//
 	// If it isn't possible then return fs.ErrorCantMove
-	Move func(src Object, remote string) (Object, error)
+	Move func(ctx context.Context, src Object, remote string) (Object, error)
 
 	// DirMove moves src, srcRemote to this remote at dstRemote
 	// using server side move operations.
@@ -448,12 +554,12 @@ type Features struct {
 	// If it isn't possible then return fs.ErrorCantDirMove
 	//
 	// If destination exists then return fs.ErrorDirExists
-	DirMove func(src Fs, srcRemote, dstRemote string) error
+	DirMove func(ctx context.Context, src Fs, srcRemote, dstRemote string) error
 
 	// ChangeNotify calls the passed function with a path
 	// that has had changes. If the implementation
 	// uses polling, it should adhere to the given interval.
-	ChangeNotify func(func(string, EntryType), <-chan time.Duration)
+	ChangeNotify func(context.Context, func(string, EntryType), <-chan time.Duration)
 
 	// UnWrap returns the Fs that this Fs is wrapping
 	UnWrap func() Fs
@@ -469,7 +575,7 @@ type Features struct {
 	DirCacheFlush func()
 
 	// PublicLink generates a public link to the remote path (usually readable by anyone)
-	PublicLink func(remote string) (string, error)
+	PublicLink func(ctx context.Context, remote string, expire Duration, unlink bool) (string, error)
 
 	// Put in to the remote path with the modTime given of the given size
 	//
@@ -479,24 +585,24 @@ type Features struct {
 	//
 	// May create duplicates or return errors if src already
 	// exists.
-	PutUnchecked func(in io.Reader, src ObjectInfo, options ...OpenOption) (Object, error)
+	PutUnchecked func(ctx context.Context, in io.Reader, src ObjectInfo, options ...OpenOption) (Object, error)
 
 	// PutStream uploads to the remote path with the modTime given of indeterminate size
 	//
 	// May create the object even if it returns an error - if so
 	// will return the object and the error, otherwise will return
 	// nil and the error
-	PutStream func(in io.Reader, src ObjectInfo, options ...OpenOption) (Object, error)
+	PutStream func(ctx context.Context, in io.Reader, src ObjectInfo, options ...OpenOption) (Object, error)
 
 	// MergeDirs merges the contents of all the directories passed
 	// in into the first one and rmdirs the other directories.
-	MergeDirs func([]Directory) error
+	MergeDirs func(ctx context.Context, dirs []Directory) error
 
 	// CleanUp the trash in the Fs
 	//
 	// Implement this if you have a way of emptying the trash or
 	// otherwise cleaning up old versions of files.
-	CleanUp func() error
+	CleanUp func(ctx context.Context) error
 
 	// ListR lists the objects and directories of the Fs starting
 	// from dir recursively into out.
@@ -517,7 +623,31 @@ type Features struct {
 	ListR ListRFn
 
 	// About gets quota information from the Fs
-	About func() (*Usage, error)
+	About func(ctx context.Context) (*Usage, error)
+
+	// OpenWriterAt opens with a handle for random access writes
+	//
+	// Pass in the remote desired and the size if known.
+	//
+	// It truncates any existing object
+	OpenWriterAt func(ctx context.Context, remote string, size int64) (WriterAtCloser, error)
+
+	// UserInfo returns info about the connected user
+	UserInfo func(ctx context.Context) (map[string]string, error)
+
+	// Disconnect the current user
+	Disconnect func(ctx context.Context) error
+
+	// Command the backend to run a named command
+	//
+	// The command run is name
+	// args may be used to read arguments from
+	// opts may be used to read optional arguments from
+	//
+	// The result should be capable of being JSON encoded
+	// If it is a string or a []string it will be shown to the user
+	// otherwise it will be JSON encoded and shown to the user like that
+	Command func(ctx context.Context, name string, arg []string, opt map[string]string) (interface{}, error)
 }
 
 // Disable nil's out the named feature.  If it isn't found then it
@@ -549,6 +679,26 @@ func (ft *Features) List() (out []string) {
 		out = append(out, vType.Field(i).Name)
 	}
 	return out
+}
+
+// Enabled returns a map of features with keys showing whether they
+// are enabled or not
+func (ft *Features) Enabled() (features map[string]bool) {
+	v := reflect.ValueOf(ft).Elem()
+	vType := v.Type()
+	features = make(map[string]bool, v.NumField())
+	for i := 0; i < v.NumField(); i++ {
+		vName := vType.Field(i).Name
+		field := v.Field(i)
+		if field.Kind() == reflect.Func {
+			// Can't compare functions
+			features[vName] = !field.IsNil()
+		} else {
+			zero := reflect.Zero(field.Type())
+			features[vName] = field.Interface() != zero.Interface()
+		}
+	}
+	return features
 }
 
 // DisableList nil's out the comma separated list of named features.
@@ -610,6 +760,18 @@ func (ft *Features) Fill(f Fs) *Features {
 	if do, ok := f.(Abouter); ok {
 		ft.About = do.About
 	}
+	if do, ok := f.(OpenWriterAter); ok {
+		ft.OpenWriterAt = do.OpenWriterAt
+	}
+	if do, ok := f.(UserInfoer); ok {
+		ft.UserInfo = do.UserInfo
+	}
+	if do, ok := f.(Disconnecter); ok {
+		ft.Disconnect = do.Disconnect
+	}
+	if do, ok := f.(Commander); ok {
+		ft.Command = do.Command
+	}
 	return ft.DisableList(Config.DisableFeatures)
 }
 
@@ -627,6 +789,7 @@ func (ft *Features) Mask(f Fs) *Features {
 	ft.WriteMimeType = ft.WriteMimeType && mask.WriteMimeType
 	ft.CanHaveEmptyDirectories = ft.CanHaveEmptyDirectories && mask.CanHaveEmptyDirectories
 	ft.BucketBased = ft.BucketBased && mask.BucketBased
+	ft.BucketBasedRootOK = ft.BucketBasedRootOK && mask.BucketBasedRootOK
 	ft.SetTier = ft.SetTier && mask.SetTier
 	ft.GetTier = ft.GetTier && mask.GetTier
 
@@ -648,8 +811,14 @@ func (ft *Features) Mask(f Fs) *Features {
 	// if mask.UnWrap == nil {
 	// 	ft.UnWrap = nil
 	// }
+	// if mask.Wrapper == nil {
+	// 	ft.Wrapper = nil
+	// }
 	if mask.DirCacheFlush == nil {
 		ft.DirCacheFlush = nil
+	}
+	if mask.PublicLink == nil {
+		ft.PublicLink = nil
 	}
 	if mask.PutUnchecked == nil {
 		ft.PutUnchecked = nil
@@ -669,6 +838,16 @@ func (ft *Features) Mask(f Fs) *Features {
 	if mask.About == nil {
 		ft.About = nil
 	}
+	if mask.OpenWriterAt == nil {
+		ft.OpenWriterAt = nil
+	}
+	if mask.UserInfo == nil {
+		ft.UserInfo = nil
+	}
+	if mask.Disconnect == nil {
+		ft.Disconnect = nil
+	}
+	// Command is always local so we don't mask it
 	return ft.DisableList(Config.DisableFeatures)
 }
 
@@ -704,7 +883,7 @@ type Purger interface {
 	// quicker than just running Remove() on the result of List()
 	//
 	// Return an error if it doesn't exist
-	Purge() error
+	Purge(ctx context.Context) error
 }
 
 // Copier is an optional interface for Fs
@@ -718,7 +897,7 @@ type Copier interface {
 	// Will only be called if src.Fs().Name() == f.Name()
 	//
 	// If it isn't possible then return fs.ErrorCantCopy
-	Copy(src Object, remote string) (Object, error)
+	Copy(ctx context.Context, src Object, remote string) (Object, error)
 }
 
 // Mover is an optional interface for Fs
@@ -732,7 +911,7 @@ type Mover interface {
 	// Will only be called if src.Fs().Name() == f.Name()
 	//
 	// If it isn't possible then return fs.ErrorCantMove
-	Move(src Object, remote string) (Object, error)
+	Move(ctx context.Context, src Object, remote string) (Object, error)
 }
 
 // DirMover is an optional interface for Fs
@@ -745,7 +924,7 @@ type DirMover interface {
 	// If it isn't possible then return fs.ErrorCantDirMove
 	//
 	// If destination exists then return fs.ErrorDirExists
-	DirMove(src Fs, srcRemote, dstRemote string) error
+	DirMove(ctx context.Context, src Fs, srcRemote, dstRemote string) error
 }
 
 // ChangeNotifier is an optional interface for Fs
@@ -756,10 +935,10 @@ type ChangeNotifier interface {
 	// At least one value will be written to the channel,
 	// specifying the initial value and updated values might
 	// follow. A 0 Duration should pause the polling.
-	// The ChangeNotify implemantion must empty the channel
-	// regulary. When the channel gets closed, the implemantion
+	// The ChangeNotify implementation must empty the channel
+	// regularly. When the channel gets closed, the implementation
 	// should stop polling and release resources.
-	ChangeNotify(func(string, EntryType), <-chan time.Duration)
+	ChangeNotify(context.Context, func(string, EntryType), <-chan time.Duration)
 }
 
 // UnWrapper is an optional interfaces for Fs
@@ -793,7 +972,7 @@ type PutUncheckeder interface {
 	//
 	// May create duplicates or return errors if src already
 	// exists.
-	PutUnchecked(in io.Reader, src ObjectInfo, options ...OpenOption) (Object, error)
+	PutUnchecked(ctx context.Context, in io.Reader, src ObjectInfo, options ...OpenOption) (Object, error)
 }
 
 // PutStreamer is an optional interface for Fs
@@ -803,20 +982,20 @@ type PutStreamer interface {
 	// May create the object even if it returns an error - if so
 	// will return the object and the error, otherwise will return
 	// nil and the error
-	PutStream(in io.Reader, src ObjectInfo, options ...OpenOption) (Object, error)
+	PutStream(ctx context.Context, in io.Reader, src ObjectInfo, options ...OpenOption) (Object, error)
 }
 
 // PublicLinker is an optional interface for Fs
 type PublicLinker interface {
 	// PublicLink generates a public link to the remote path (usually readable by anyone)
-	PublicLink(remote string) (string, error)
+	PublicLink(ctx context.Context, remote string, expire Duration, unlink bool) (string, error)
 }
 
 // MergeDirser is an option interface for Fs
 type MergeDirser interface {
 	// MergeDirs merges the contents of all the directories passed
 	// in into the first one and rmdirs the other directories.
-	MergeDirs([]Directory) error
+	MergeDirs(ctx context.Context, dirs []Directory) error
 }
 
 // CleanUpper is an optional interfaces for Fs
@@ -825,7 +1004,7 @@ type CleanUpper interface {
 	//
 	// Implement this if you have a way of emptying the trash or
 	// otherwise cleaning up old versions of files.
-	CleanUp() error
+	CleanUp(ctx context.Context) error
 }
 
 // ListRer is an optional interfaces for Fs
@@ -846,7 +1025,7 @@ type ListRer interface {
 	//
 	// Don't implement this unless you have a more efficient way
 	// of listing recursively that doing a directory traversal.
-	ListR(dir string, callback ListRCallback) error
+	ListR(ctx context.Context, dir string, callback ListRCallback) error
 }
 
 // RangeSeeker is the interface that wraps the RangeSeek method.
@@ -859,13 +1038,59 @@ type RangeSeeker interface {
 	// limiting the total length to limit.
 	//
 	// RangeSeek with a limit of < 0 is equivalent to a regular Seek.
-	RangeSeek(offset int64, whence int, length int64) (int64, error)
+	RangeSeek(ctx context.Context, offset int64, whence int, length int64) (int64, error)
 }
 
 // Abouter is an optional interface for Fs
 type Abouter interface {
 	// About gets quota information from the Fs
-	About() (*Usage, error)
+	About(ctx context.Context) (*Usage, error)
+}
+
+// OpenWriterAter is an optional interface for Fs
+type OpenWriterAter interface {
+	// OpenWriterAt opens with a handle for random access writes
+	//
+	// Pass in the remote desired and the size if known.
+	//
+	// It truncates any existing object
+	OpenWriterAt(ctx context.Context, remote string, size int64) (WriterAtCloser, error)
+}
+
+// UserInfoer is an optional interface for Fs
+type UserInfoer interface {
+	// UserInfo returns info about the connected user
+	UserInfo(ctx context.Context) (map[string]string, error)
+}
+
+// Disconnecter is an optional interface for Fs
+type Disconnecter interface {
+	// Disconnect the current user
+	Disconnect(ctx context.Context) error
+}
+
+// CommandHelp describes a single backend Command
+//
+// These are automatically inserted in the docs
+type CommandHelp struct {
+	Name  string            // Name of the command, eg "link"
+	Short string            // Single line description
+	Long  string            // Long multi-line description
+	Opts  map[string]string // maps option name to a single line help
+}
+
+// Commander is an interface to wrap the Command function
+type Commander interface {
+	// Command the backend to run a named command
+	//
+	// The command run is name
+	// args may be used to read arguments from
+	// opts may be used to read optional arguments from
+	//
+	// The result should be capable of being JSON encoded
+	// If it is a string or a []string it will be shown to the user
+	// otherwise it will be JSON encoded and shown to the user like that
+	Command(ctx context.Context, name string, arg []string, opt map[string]string) (interface{}, error)
 }
 
 // ObjectsChan is a channel of Objects
@@ -880,7 +1105,39 @@ type ObjectPair struct {
 	Src, Dst Object
 }
 
-// Find looks for an RegInfo object for the name passed in.  The name
+// UnWrapFs unwraps f as much as possible and returns the base Fs
+func UnWrapFs(f Fs) Fs {
+	for {
+		unwrap := f.Features().UnWrap
+		if unwrap == nil {
+			break // not a wrapped Fs, use current
+		}
+		next := unwrap()
+		if next == nil {
+			break // no base Fs found, use current
+		}
+		f = next
+	}
+	return f
+}
+
+// UnWrapObject unwraps o as much as possible and returns the base object
+func UnWrapObject(o Object) Object {
+	for {
+		u, ok := o.(ObjectUnWrapper)
+		if !ok {
+			break // not a wrapped object, use current
+		}
+		next := u.UnWrap()
+		if next == nil {
+			break // no base object found, use current
+		}
+		o = next
+	}
+	return o
+}
+
+// Find looks for a RegInfo object for the name passed in.  The name
 // can be either the Name or the Prefix.
 //
 // Services are looked up in the config file
@@ -909,7 +1166,10 @@ func MustFind(name string) *RegInfo {
 // ParseRemote deconstructs a path into configName, fsPath, looking up
 // the fsName in the config file (returning NotFoundInConfigFile if not found)
 func ParseRemote(path string) (fsInfo *RegInfo, configName, fsPath string, err error) {
-	configName, fsPath = fspath.Parse(path)
+	configName, fsPath, err = fspath.Parse(path)
+	if err != nil {
+		return nil, "", "", err
+	}
 	var fsName string
 	var ok bool
 	if configName != "" {
@@ -939,11 +1199,24 @@ func (configName configEnvVars) Get(key string) (value string, ok bool) {
 }
 
 // A configmap.Getter to read from the environment RCLONE_option_name
-type optionEnvVars string
+type optionEnvVars struct {
+	fsInfo *RegInfo
+}
 
 // Get a config item from the option environment variables if possible
-func (prefix optionEnvVars) Get(key string) (value string, ok bool) {
-	return os.LookupEnv(OptionToEnv(string(prefix) + "-" + key))
+func (oev optionEnvVars) Get(key string) (value string, ok bool) {
+	opt := oev.fsInfo.Options.Get(key)
+	if opt == nil {
+		return "", false
+	}
+	// For options with NoPrefix set, check without prefix too
+	if opt.NoPrefix {
+		value, ok = os.LookupEnv(OptionToEnv(key))
+		if ok {
+			return value, ok
+		}
+	}
+	return os.LookupEnv(OptionToEnv(oev.fsInfo.Prefix + "-" + key))
 }
 
 // A configmap.Getter to read either the default value or the set
@@ -956,14 +1229,9 @@ type regInfoValues struct {
 // override the values in configMap with the either the flag values or
 // the default values
 func (r *regInfoValues) Get(key string) (value string, ok bool) {
-	for i := range r.fsInfo.Options {
-		o := &r.fsInfo.Options[i]
-		if o.Name == key {
-			if r.useDefault || o.Value != nil {
-				return o.String(), true
-			}
-			break
-		}
+	opt := r.fsInfo.Options.Get(key)
+	if opt != nil && (r.useDefault || opt.Value != nil) {
+		return opt.String(), true
 	}
 	return "", false
 }
@@ -974,7 +1242,10 @@ type setConfigFile string
 // Set a config item into the config file
 func (section setConfigFile) Set(key, value string) {
 	Debugf(nil, "Saving config %q = %q in section %q of the config file", key, value, section)
-	ConfigFileSet(string(section), key, value)
+	err := ConfigFileSet(string(section), key, value)
+	if err != nil {
+		Errorf(nil, "Failed saving config %q = %q in section %q of the config file: %v", key, value, section, err)
+	}
 }
 
 // A configmap.Getter to read from the config file
@@ -1011,7 +1282,7 @@ func ConfigMap(fsInfo *RegInfo, configName string) (config *configmap.Map) {
 
 	// backend specific environment vars
 	if fsInfo != nil {
-		config.AddGetter(optionEnvVars(fsInfo.Prefix))
+		config.AddGetter(optionEnvVars{fsInfo: fsInfo})
 	}
 
 	// config file
@@ -1060,6 +1331,17 @@ func NewFs(path string) (Fs, error) {
 	return fsInfo.NewFs(configName, fsPath, config)
 }
 
+// ConfigString returns a canonical version of the config string used
+// to configure the Fs as passed to fs.NewFs
+func ConfigString(f Fs) string {
+	name := f.Name()
+	root := f.Root()
+	if name == "local" && f.Features().IsLocal {
+		return root
+	}
+	return name + ":" + root
+}
+
 // TemporaryLocalFs creates a local FS in the OS's temporary directory.
 //
 // No cleanup is performed, the caller must call Purge on the Fs themselves.
@@ -1086,8 +1368,8 @@ func CheckClose(c io.Closer, err *error) {
 
 // FileExists returns true if a file remote exists.
 // If remote is a directory, FileExists returns false.
-func FileExists(fs Fs, remote string) (bool, error) {
-	_, err := fs.NewObject(remote)
+func FileExists(ctx context.Context, fs Fs, remote string) (bool, error) {
+	_, err := fs.NewObject(ctx, remote)
 	if err != nil {
 		if err == ErrorObjectNotFound || err == ErrorNotAFile || err == ErrorPermissionDenied {
 			return false, nil

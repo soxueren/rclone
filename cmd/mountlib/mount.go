@@ -9,13 +9,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ncw/rclone/cmd"
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/config"
-	"github.com/ncw/rclone/fs/config/flags"
-	"github.com/ncw/rclone/vfs"
-	"github.com/ncw/rclone/vfs/vfsflags"
 	"github.com/pkg/errors"
+	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/config/flags"
+	"github.com/rclone/rclone/vfs"
+	"github.com/rclone/rclone/vfs/vfsflags"
 	"github.com/spf13/cobra"
 )
 
@@ -36,7 +36,27 @@ var (
 	NoAppleDouble      = true        // use noappledouble by default
 	NoAppleXattr       = false       // do not use noapplexattr by default
 	DaemonTimeout      time.Duration // OSXFUSE only
+	AsyncRead          = true        // do async reads by default
 )
+
+type (
+	// UnmountFn is called to unmount the file system
+	UnmountFn func() error
+	// MountFn is called to mount the file system
+	MountFn func(f fs.Fs, mountpoint string) (*vfs.VFS, <-chan error, func() error, error)
+)
+
+// Global constants
+const (
+	MaxLeafSize = 1024 // don't pass file names longer than this
+)
+
+func init() {
+	// DaemonTimeout defaults to non zero for macOS
+	if runtime.GOOS == "darwin" {
+		DaemonTimeout = 15 * time.Minute
+	}
+}
 
 // Check is folder is empty
 func checkMountEmpty(mountpoint string) error {
@@ -86,10 +106,11 @@ func checkMountpointOverlap(root, mountpoint string) error {
 }
 
 // NewMountCommand makes a mount command with the given name and Mount function
-func NewMountCommand(commandName string, Mount func(f fs.Fs, mountpoint string) error) *cobra.Command {
-	var commandDefintion = &cobra.Command{
-		Use:   commandName + " remote:path /path/to/mountpoint",
-		Short: `Mount the remote as file system on a mountpoint.`,
+func NewMountCommand(commandName string, hidden bool, Mount func(f fs.Fs, mountpoint string) error) *cobra.Command {
+	var commandDefinition = &cobra.Command{
+		Use:    commandName + " remote:path /path/to/mountpoint",
+		Hidden: hidden,
+		Short:  `Mount the remote as file system on a mountpoint.`,
 		Long: `
 rclone ` + commandName + ` allows Linux, FreeBSD, macOS and Windows to
 mount any of Rclone's cloud storage systems as a file system with
@@ -97,19 +118,31 @@ FUSE.
 
 First set up your remote using ` + "`rclone config`" + `.  Check it works with ` + "`rclone ls`" + ` etc.
 
-Start the mount like this
+You can either run mount in foreground mode or background (daemon) mode. Mount runs in
+foreground mode by default, use the --daemon flag to specify background mode mode.
+Background mode is only supported on Linux and OSX, you can only run mount in
+foreground mode on Windows.
+
+On Linux/macOS/FreeBSD Start the mount like this where ` + "`/path/to/local/mount`" + `
+is an **empty** **existing** directory.
 
     rclone ` + commandName + ` remote:path/to/files /path/to/local/mount
 
-Or on Windows like this where X: is an unused drive letter
+Or on Windows like this where ` + "`X:`" + ` is an unused drive letter
+or use a path to **non-existent** directory.
 
     rclone ` + commandName + ` remote:path/to/files X:
+    rclone ` + commandName + ` remote:path/to/files C:\path\to\nonexistent\directory
 
-When the program ends, either via Ctrl+C or receiving a SIGINT or SIGTERM signal,
-the mount is automatically stopped.
+When running in background mode the user will have to stop the mount manually (specified below).
+
+When the program ends while in foreground mode, either via Ctrl+C or receiving
+a SIGINT or SIGTERM signal, the mount is automatically stopped.
 
 The umount operation can fail, for example when the mountpoint is busy.
-When that happens, it is the user's responsibility to stop the mount manually with
+When that happens, it is the user's responsibility to stop the mount manually.
+
+Stopping the mount manually:
 
     # Linux
     fusermount -u /path/to/local/mount
@@ -121,7 +154,7 @@ When that happens, it is the user's responsibility to stop the mount manually wi
 To run rclone ` + commandName + ` on Windows, you will need to
 download and install [WinFsp](http://www.secfs.net/winfsp/).
 
-WinFsp is an [open source](https://github.com/billziss-gh/winfsp)
+[WinFsp](https://github.com/billziss-gh/winfsp) is an open source
 Windows File System Proxy which makes it easy to write user space file
 systems for Windows.  It provides a FUSE emulation layer which rclone
 uses combination with
@@ -145,6 +178,34 @@ infrastructure](https://github.com/billziss-gh/winfsp/wiki/WinFsp-Service-Archit
 which creates drives accessible for everyone on the system or
 alternatively using [the nssm service manager](https://nssm.cc/usage).
 
+#### Mount as a network drive
+
+By default, rclone will mount the remote as a normal drive. However,
+you can also mount it as a **Network Drive** (or **Network Share**, as
+mentioned in some places)
+
+Unlike other systems, Windows provides a different filesystem type for
+network drives.  Windows and other programs treat the network drives
+and fixed/removable drives differently: In network drives, many I/O
+operations are optimized, as the high latency and low reliability
+(compared to a normal drive) of a network is expected.
+
+Although many people prefer network shares to be mounted as normal
+system drives, this might cause some issues, such as programs not
+working as expected or freezes and errors while operating with the
+mounted remote in Windows Explorer. If you experience any of those,
+consider mounting rclone remotes as network shares, as Windows expects
+normal drives to be fast and reliable, while cloud storage is far from
+that.  See also [Limitations](#limitations) section below for more
+info
+
+Add "--fuse-flag --VolumePrefix=\server\share" to your "mount"
+command, **replacing "share" with any other name of your choice if you
+are mounting more than one remote**. Otherwise, the mountpoints will
+conflict and your mounted filesystems will overlap.
+
+[Read more about drive mapping](https://en.wikipedia.org/wiki/Drive_mapping)
+
 ### Limitations
 
 Without the use of "--vfs-cache-mode" this can only write files
@@ -154,10 +215,7 @@ applications won't work with their files on an rclone mount without
 Caching](#file-caching) section for more info.
 
 The bucket based remotes (eg Swift, S3, Google Compute Storage, B2,
-Hubic) won't work from the root - you will need to specify a bucket,
-or a path within the bucket.  So ` + "`swift:`" + ` won't work whereas
-` + "`swift:bucket`" + ` will as will ` + "`swift:bucket/path`" + `.
-None of these support the concept of directories, so empty
+Hubic) do not support the concept of empty directories, so empty
 directories will have a tendency to disappear once they fall out of
 the directory cache.
 
@@ -183,9 +241,9 @@ too many callbacks to rclone from the kernel.
 In theory 0s should be the correct value for filesystems which can
 change outside the control of the kernel. However this causes quite a
 few problems such as
-[rclone using too much memory](https://github.com/ncw/rclone/issues/2157),
+[rclone using too much memory](https://github.com/rclone/rclone/issues/2157),
 [rclone not serving files to samba](https://forum.rclone.org/t/rclone-1-39-vs-1-40-mount-issue/5112)
-and [excessive time listing directories](https://github.com/ncw/rclone/issues/2095#issuecomment-371141147).
+and [excessive time listing directories](https://github.com/rclone/rclone/issues/2095#issuecomment-371141147).
 
 The kernel can cache the info about a file for the time given by
 "--attr-timeout". You may see corruption if the remote file changes
@@ -264,6 +322,8 @@ be copied to the vfs cache before opening with --vfs-cache-mode full.
 				if err != nil {
 					log.Fatalf("Fatal error: %v", err)
 				}
+			} else if AllowNonEmpty && runtime.GOOS == "windows" {
+				fs.Logf(nil, "--allow-non-empty flag does nothing on Windows")
 			}
 
 			// Work out the volume name, removing special
@@ -274,6 +334,9 @@ be copied to the vfs cache before opening with --vfs-cache-mode full.
 			VolumeName = strings.Replace(VolumeName, ":", " ", -1)
 			VolumeName = strings.Replace(VolumeName, "/", " ", -1)
 			VolumeName = strings.TrimSpace(VolumeName)
+			if runtime.GOOS == "windows" && len(VolumeName) > 32 {
+				VolumeName = VolumeName[:32]
+			}
 
 			// Start background task if --background is specified
 			if Daemon {
@@ -291,37 +354,38 @@ be copied to the vfs cache before opening with --vfs-cache-mode full.
 	}
 
 	// Register the command
-	cmd.Root.AddCommand(commandDefintion)
+	cmd.Root.AddCommand(commandDefinition)
 
 	// Add flags
-	flagSet := commandDefintion.Flags()
-	flags.BoolVarP(flagSet, &DebugFUSE, "debug-fuse", "", DebugFUSE, "Debug the FUSE internals - needs -v.")
+	cmdFlags := commandDefinition.Flags()
+	flags.BoolVarP(cmdFlags, &DebugFUSE, "debug-fuse", "", DebugFUSE, "Debug the FUSE internals - needs -v.")
 	// mount options
-	flags.BoolVarP(flagSet, &AllowNonEmpty, "allow-non-empty", "", AllowNonEmpty, "Allow mounting over a non-empty directory.")
-	flags.BoolVarP(flagSet, &AllowRoot, "allow-root", "", AllowRoot, "Allow access to root user.")
-	flags.BoolVarP(flagSet, &AllowOther, "allow-other", "", AllowOther, "Allow access to other users.")
-	flags.BoolVarP(flagSet, &DefaultPermissions, "default-permissions", "", DefaultPermissions, "Makes kernel enforce access control based on the file mode.")
-	flags.BoolVarP(flagSet, &WritebackCache, "write-back-cache", "", WritebackCache, "Makes kernel buffer writes before sending them to rclone. Without this, writethrough caching is used.")
-	flags.FVarP(flagSet, &MaxReadAhead, "max-read-ahead", "", "The number of bytes that can be prefetched for sequential reads.")
-	flags.DurationVarP(flagSet, &AttrTimeout, "attr-timeout", "", AttrTimeout, "Time for which file/directory attributes are cached.")
-	flags.StringArrayVarP(flagSet, &ExtraOptions, "option", "o", []string{}, "Option for libfuse/WinFsp. Repeat if required.")
-	flags.StringArrayVarP(flagSet, &ExtraFlags, "fuse-flag", "", []string{}, "Flags or arguments to be passed direct to libfuse/WinFsp. Repeat if required.")
-	flags.BoolVarP(flagSet, &Daemon, "daemon", "", Daemon, "Run mount as a daemon (background mode).")
-	flags.StringVarP(flagSet, &VolumeName, "volname", "", VolumeName, "Set the volume name (not supported by all OSes).")
-	flags.DurationVarP(flagSet, &DaemonTimeout, "daemon-timeout", "", DaemonTimeout, "Time limit for rclone to respond to kernel (not supported by all OSes).")
+	flags.BoolVarP(cmdFlags, &AllowNonEmpty, "allow-non-empty", "", AllowNonEmpty, "Allow mounting over a non-empty directory (not Windows).")
+	flags.BoolVarP(cmdFlags, &AllowRoot, "allow-root", "", AllowRoot, "Allow access to root user.")
+	flags.BoolVarP(cmdFlags, &AllowOther, "allow-other", "", AllowOther, "Allow access to other users.")
+	flags.BoolVarP(cmdFlags, &DefaultPermissions, "default-permissions", "", DefaultPermissions, "Makes kernel enforce access control based on the file mode.")
+	flags.BoolVarP(cmdFlags, &WritebackCache, "write-back-cache", "", WritebackCache, "Makes kernel buffer writes before sending them to rclone. Without this, writethrough caching is used.")
+	flags.FVarP(cmdFlags, &MaxReadAhead, "max-read-ahead", "", "The number of bytes that can be prefetched for sequential reads.")
+	flags.DurationVarP(cmdFlags, &AttrTimeout, "attr-timeout", "", AttrTimeout, "Time for which file/directory attributes are cached.")
+	flags.StringArrayVarP(cmdFlags, &ExtraOptions, "option", "o", []string{}, "Option for libfuse/WinFsp. Repeat if required.")
+	flags.StringArrayVarP(cmdFlags, &ExtraFlags, "fuse-flag", "", []string{}, "Flags or arguments to be passed direct to libfuse/WinFsp. Repeat if required.")
+	flags.BoolVarP(cmdFlags, &Daemon, "daemon", "", Daemon, "Run mount as a daemon (background mode).")
+	flags.StringVarP(cmdFlags, &VolumeName, "volname", "", VolumeName, "Set the volume name (not supported by all OSes).")
+	flags.DurationVarP(cmdFlags, &DaemonTimeout, "daemon-timeout", "", DaemonTimeout, "Time limit for rclone to respond to kernel (not supported by all OSes).")
+	flags.BoolVarP(cmdFlags, &AsyncRead, "async-read", "", AsyncRead, "Use asynchronous reads.")
 
 	if runtime.GOOS == "darwin" {
-		flags.BoolVarP(flagSet, &NoAppleDouble, "noappledouble", "", NoAppleDouble, "Sets the OSXFUSE option noappledouble.")
-		flags.BoolVarP(flagSet, &NoAppleXattr, "noapplexattr", "", NoAppleXattr, "Sets the OSXFUSE option noapplexattr.")
+		flags.BoolVarP(cmdFlags, &NoAppleDouble, "noappledouble", "", NoAppleDouble, "Sets the OSXFUSE option noappledouble.")
+		flags.BoolVarP(cmdFlags, &NoAppleXattr, "noapplexattr", "", NoAppleXattr, "Sets the OSXFUSE option noapplexattr.")
 	}
 
 	// Add in the generic flags
-	vfsflags.AddFlags(flagSet)
+	vfsflags.AddFlags(cmdFlags)
 
-	return commandDefintion
+	return commandDefinition
 }
 
-// ClipBlocks clips the blocks pointed to to the OS max
+// ClipBlocks clips the blocks pointed to the OS max
 func ClipBlocks(b *uint64) {
 	var max uint64
 	switch runtime.GOOS {
